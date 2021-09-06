@@ -1,1 +1,184 @@
+####### to read dataset
+library(readxl)
+datam<- read_excel("C:/Users/USER/Downloads/malaria_dataset.xlsx")
+head(datam)
+library(summarytools)
+freq(datam$v190)
+########### To Recode some variables by putting them into categories and imputing them using KNN to remove missing values
+
+datam$v190[datam$v190 == "middle"] <- 0
+datam$v190[datam$v190 == "poorer"] <- 1
+datam$v190[datam$v190 == "poorest"] <- 1
+datam$v190[datam$v190 == "richer"] <- 2
+datam$v190[datam$v190 == "richest"] <- 2
+freq(datam$v190)
+library(VIM)
+?kNN
+datam1 <- kNN(datam, variable = c ("v190"),k=1, catFun = 'maxCat',metric = 'nan_euclidean')
+datam1
+
+freq(datam1$h22)
+datam1$h22[datam1$h22 == 9] <- NA
+datam1$h22[datam1$h22 == "don't know"] <- NA
+datam1$h22[datam1$h22 == "dk"] <- NA
+datam1$h22[datam1$h22 == "no"] <- 0
+datam1$h22[datam1$h22 == "yes"] <- 1
+freq(datam1$h22)
+datam2 <- kNN(datam1, variable = c ("h22"),k=1, catFun = 'maxCat',metric = 'nan_euclidean')
+datam2
+freq(datam2$h22)
+## the dimension of datasets 
+library(geoR)
+dim(datam2)
+dim(unique(datam2[, c("Longitude", "Latitude")]))
+
+##We create a data frame called d containing the total number of tests performed (total), the number of positive tests (positive), and the malaria prevalence (prev).
+
+library(dplyr)
+d<- group_by(datam2,Longitude,Latitude,Country) %>%
+  summarize(
+    total = n(),
+    positive = sum(hml35),
+    prev = positive / total
+  )
+head(d)
+
+# Mapping prevalence
+
+library(leaflet)
+library(viridisLite)
+library(viridis)
+
+pal <- colorBin("viridis", bins = c(0, 0.25, 0.5, 0.75, 1))
+leaflet(d) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircles(lng =~ Longitude, lat =~ Latitude, color = ~ pal(prev)) %>%
+  addLegend("bottomright",
+            pal = pal, values = ~prev,
+            title = "Prev."
+  ) %>%
+  addScaleBar(position = c("bottomleft"))
+
+##Environmental covariates
+
+#install.packages(c("rgdal","rgeos"), lib="c:/r/packages")
+library(rgeos)
+library(rgdal)
+library(raster)
+library(spatial)
+rw_raster = getData('alt', country='RWA', mask=TRUE)
+bdi_raster = getData('alt', country='BDI', mask=TRUE)
+ken_raster = getData('alt', country='KEN', mask=TRUE)
+tza_raster = getData('alt', country='TZA', mask=TRUE)
+
+r <- mosaic(rw_raster,bdi_raster,ken_raster,tza_raster, fun=mean)
+
+pal <- colorNumeric("viridis", values(r),
+                    na.color = "transparent"
+)
+
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addRasterImage(r, colors = pal, opacity = 0.5) %>%
+  addLegend("bottomright",
+            pal = pal, values = values(r),
+            title = "Altitude"
+  ) %>%
+  addScaleBar(position = c("bottomleft"))
+
+
+##The dataset becomes 
+
+d$alt <- raster::extract(r, d[, c("Longitude", "Latitude")])
+head(d)
+######## Generating final dataset which groups Prevalence and independent variables (we used only 2 variables as trial) 
+
+d1 <- group_by(datam2,Longitude,Latitude,Country) %>%
+  summarize(
+    total = n(),
+    positive = sum(hml35),
+    Wealthindex = datam2$v190,
+    Fever = datam2$h22,
+    prev = positive / total ,
+  )
+head(d1)
+
+d1$alt <- raster::extract(r, d1[, c("Longitude", "Latitude")])
+head(d1)
+library(foreach)
+library(parallel)
+library(Matrix)
+library(INLA)
+coo <- cbind(d1$Longitude, d1$Latitude)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+mesh$n
+plot(mesh)
+points(coo, col = "green")
+
+###Building the SPDE model on the mesh
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+##Index set
+indexs <- inla.spde.make.index("s", spde$n.spde)
+lengths(indexs)
+##Projection matrix
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+dim(A)
+nrow(coo)
+rowSums(A)
+##  Prediction data
+dp <- rasterToPoints(r)
+dim(dp)
+
+ra <- aggregate(r, fact = 5, fun = mean)
+
+dp <- rasterToPoints(ra)
+dim(dp) 
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+###Stack with data for estimation and prediction
+# stack for estimation stk.e
+
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = d1$positive, numtrials = d1$total),
+  A = list(1, A),
+ 
+  effects = list(data.frame(b0=1,altitude = d1$alt,Wealthindex = d1$Wealthindex,Fever = d1$Fever), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0=1, altitude = dp[, 3]),
+                 s = indexs
+  )
+  
+  
+)
+
+# stk.full has stk.e and stk.p
+
+stk.full <- inla.stack(stk.e, stk.p)
+
+##Model formula
+
+formula <- y ~ b0 + altitude + Fever+ Wealthindex + f(s, model = spde)
+
+###inla() call
+
+res <- inla(formula,
+            family = "binomial", Ntrials = numtrials,
+            data = inla.stack.data(stk.full,spde = spde),
+            control.family = list(link = "logit"),
+            control.predictor = list(A = inla.stack.A(stk.full),
+                                     compute = TRUE),
+            control.compute = list(cpo = FALSE, dic = TRUE),
+            keep = FALSE,
+            verbose = TRUE)
 
