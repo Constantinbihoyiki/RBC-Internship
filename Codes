@@ -1,4 +1,4 @@
-####### to read dataset
+####### To read dataset
 library(readxl)
 datam<- read_excel("C:/Users/USER/Downloads/malaria_dataset.xlsx")
 head(datam)
