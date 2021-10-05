@@ -181,4 +181,3 @@ res <- inla(formula,
             control.compute = list(cpo = FALSE, dic = TRUE),
             keep = FALSE,
             verbose = TRUE)
-
